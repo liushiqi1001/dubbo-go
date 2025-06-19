@@ -30,11 +30,12 @@ import (
 )
 
 var (
-	methodStatistics    sync.Map        // url -> { methodName : RPCStatus}
-	serviceStatistic    sync.Map        // url -> RPCStatus
-	invokerBlackList    sync.Map        // store unhealthy url blackList
-	blackListCacheDirty uberAtomic.Bool // store if the cache in chain is not refreshed by blacklist
-	blackListRefreshing int32           // store if the refresing method is processing
+	methodStatistics         sync.Map         // url -> { methodName : RPCStatus}
+	serviceStatistic         sync.Map         // url -> RPCStatus
+	invokerBlackList         sync.Map         // store unhealthy url blackList
+	blackListCacheDirty      uberAtomic.Bool  // store if the cache in chain is not refreshed by blacklist
+	blackListRefreshing      int32            // store if the refresing method is processing
+	lastBlackListRefreshTime uberAtomic.Int64 // 上次黑名单刷新时间
 )
 
 func init() {
@@ -205,15 +206,27 @@ func GetInvokerHealthyStatus(invoker Invoker) bool {
 
 // SetInvokerUnhealthyStatus add target invoker to black list
 func SetInvokerUnhealthyStatus(invoker Invoker) {
-	invokerBlackList.Store(invoker.GetURL().Key(), invoker)
-	logger.Info("Add invoker ip = ", invoker.GetURL().Location, " to black list")
+	key := invoker.GetURL().Key()
+	// 避免重复添加相同的invoker到黑名单
+	if _, exists := invokerBlackList.Load(key); exists {
+		logger.Debug("Invoker ip = ", invoker.GetURL().Location, " already in black list")
+		return
+	}
+	invokerBlackList.Store(key, invoker)
+	logger.Warn("Add invoker ip = ", invoker.GetURL().Location, " to black list")
 	blackListCacheDirty.Store(true)
 }
 
 // RemoveInvokerUnhealthyStatus remove unhealthy status of target invoker from blacklist
 func RemoveInvokerUnhealthyStatus(invoker Invoker) {
-	invokerBlackList.Delete(invoker.GetURL().Key())
-	logger.Info("Remove invoker ip = ", invoker.GetURL().Location, " from black list")
+	key := invoker.GetURL().Key()
+	// 检查invoker是否真的在黑名单中
+	if _, exists := invokerBlackList.Load(key); !exists {
+		logger.Debug("Invoker ip = ", invoker.GetURL().Location, " not in black list")
+		return
+	}
+	invokerBlackList.Delete(key)
+	logger.Warn("Remove invoker ip = ", invoker.GetURL().Location, " from black list")
 	blackListCacheDirty.Store(true)
 }
 
@@ -246,10 +259,20 @@ func GetAndRefreshState() bool {
 // TryRefreshBlackList start 3 gr to check at most block=16 invokers in black list
 // if target invoker is available, then remove it from black list
 func TryRefreshBlackList() {
+	now := CurrentTimeMillis()
+	lastRefresh := lastBlackListRefreshTime.Load()
+
+	// 限制刷新频率：至少间隔5秒才能进行下一次刷新
+	if now-lastRefresh < 5000 {
+		logger.Debug("Blacklist refresh skipped, too frequent")
+		return
+	}
+
 	if atomic.CompareAndSwapInt32(&blackListRefreshing, 0, 1) {
 		wg := sync.WaitGroup{}
 		defer func() {
 			atomic.CompareAndSwapInt32(&blackListRefreshing, 1, 0)
+			lastBlackListRefreshTime.Store(now)
 		}()
 
 		ivks := GetBlackListInvokers(constant.DefaultBlackListRecoverBlock)
