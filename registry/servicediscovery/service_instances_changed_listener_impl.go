@@ -242,9 +242,35 @@ func GetMetadataInfo(app string, instance registry.ServiceInstance, revision str
 			return nil, err
 		}
 	} else {
-		metadataInfo, err = metadata.GetMetadataFromRpc(revision, instance)
+		// Add panic recovery for Java-Go metadata incompatibility
+		// Catch panic from Hessian2 deserialization errors
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Errorf("Recovered from panic in GetMetadataFromRpc (Java-Go incompatibility): %v, instance: %s, revision: %s",
+						r, instance.GetHost(), revision)
+					// Create a minimal MetadataInfo to allow service discovery to continue
+					metadataInfo = &info.MetadataInfo{
+						App:      instance.GetServiceName(),
+						Revision: revision,
+						Services: make(map[string]*info.ServiceInfo),
+					}
+					err = nil // Clear error to continue with fallback metadata
+				}
+			}()
+			metadataInfo, err = metadata.GetMetadataFromRpc(revision, instance)
+		}()
+
 		if err != nil {
-			return nil, err
+			logger.Warnf("Failed to get metadata from RPC, using fallback: %v", err)
+			// Use fallback metadata if RPC call failed
+			if metadataInfo == nil {
+				metadataInfo = &info.MetadataInfo{
+					App:      instance.GetServiceName(),
+					Revision: revision,
+					Services: make(map[string]*info.ServiceInfo),
+				}
+			}
 		}
 	}
 	metaCache.Set(revision, metadataInfo)
